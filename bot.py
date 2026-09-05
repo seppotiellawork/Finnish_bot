@@ -6,12 +6,14 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pypdf import PdfReader
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+from google import genai
 
+# שרת דמוי HTTP כדי ש-Render לא יסגור את הבוט (Keep-alive)
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Finnish Tutor Bot is alive!")
+        self.wfile.write(b"Finnish AI Tutor Bot is alive!")
 
 def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
@@ -24,6 +26,11 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
+
+# אתחול הלקוח של Google GenAI
+client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
+
 user_data_store = {}
 
 def download_file_from_google_drive(url, destination):
@@ -53,35 +60,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     chat_id = update.message.chat_id
     
-    # 1. טעינת הקישור מגוגל דרייב
+    # 1. טיפול בקישור לגוגל דרייב
     if "drive.google.com" in user_text:
-        await update.message.reply_text("📥 Loading your textbook from Google Drive and preparing our lessons...")
+        await update.message.reply_text("📥 Loading your textbook and connecting it to your AI tutor...")
         try:
             file_path = f"temp_{chat_id}.pdf"
             download_file_from_google_drive(user_text, file_path)
             
             reader = PdfReader(file_path)
             extracted_text = ""
-            max_pages = min(len(reader.pages), 50)
+            max_pages = min(len(reader.pages), 60) # טעינת עד 60 עמודים ראשונים כהקשר
             for i in range(max_pages):
                 text = reader.pages[i].extract_text()
                 if text:
                     extracted_text += text + "\n"
                     
-            # שמירת הספר ומצב הלמידה של התלמיד
             user_data_store[chat_id] = {
                 "book_text": extracted_text,
-                "step": 0, # שלב התקדמות בשיעור
-                "waiting_for_answer": False
+                "history": []
             }
             
             if os.path.exists(file_path):
                 os.remove(file_path)
                 
             await update.message.reply_text(
-                "✅ Textbook loaded successfully!\n\n"
-                "I am your personal Finnish tutor. We are going to go through the book together step by step.\n"
-                "Type **'start'** whenever you're ready for our first lesson!"
+                "✅ Textbook loaded successfully! I am now your personal Finnish tutor powered by AI.\n"
+                "Ask me anything about the book, or tell me what you'd like to learn first!"
             )
             return
         except Exception as e:
@@ -96,39 +100,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     student = user_data_store[chat_id]
     
-    # 2. ניהול השיחה והלימוד המשותף
-    if "start" in user_text.lower() or student["step"] == 0:
-        student["step"] = 1
-        student["waiting_for_answer"] = True
-        await update.message.reply_text(
-            "📖 **Lesson 1: Introduction & Greetings (Kappale 1)**\n\n"
-            "Let's start from the beginning of your book. In Finnish, when you meet someone for the first time, you say:\n"
-            "• *Hei* or *Moi* (Hello / Hi)\n"
-            "• *Hauska tutustua!* (Nice to meet you!)\n\n"
-            "🧠 **Question for you:** How do you say 'Nice to meet you!' in Finnish based on what we just saw? Type your answer to me!"
+    if not client:
+        await update.message.reply_text("⚠️ Error: GEMINI_API_KEY is missing in Render Environment variables.")
+        return
+
+    # 2. בניית הנחיית מערכת (System Instructions) למורה הפרטי
+    system_instruction = (
+        "You are an expert, friendly, and conversational Finnish private tutor. "
+        "You are helping a student learn Finnish step-by-step using their textbook content provided below. "
+        "Speak naturally like a human tutor, explain grammar simply, give examples, ask engaging questions, "
+        "and correct the student gently if they make mistakes.\n\n"
+        f"--- TEXTBOOK CONTENT ---\n{student['book_text'][:15000]}"
+    )
+
+    try:
+        # שמירת היסטוריית שיחה ושליחה ל-Gemini
+        chat_history = student.get("history", [])
+        chat_history.append({"role": "user", "parts": [{"text": user_text}]})
+        
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=chat_history,
+            config={
+                'system_instruction': system_instruction,
+                'temperature': 0.7,
+            }
         )
-    elif student["waiting_for_answer"]:
-        # בדיקת תשובת התלמיד ומעבר לשלב הבא
-        student["waiting_for_answer"] = False
-        student["step"] = 2
-        await update.message.reply_text(
-            "Great job! That's correct (*Hauska tutustua*).\n\n"
-            "Now let's look at pronouns in Finnish (Personal Pronons):\n"
-            "• *minä* = I\n"
-            "• *sinä* = You\n"
-            "• *hän* = He / She\n\n"
-            "🧠 **Next question:** If *minä* is 'I', how do you say 'You' in Finnish? Let me know!"
-        )
-        student["waiting_for_answer"] = True
-    else:
-        # מענה כללי וממוקד להמשך השיחה
-        await update.message.reply_text(
-            f"I hear you! Let's keep practicing. Tell me your answer or type **'start'** to restart our current lesson flow."
-        )
+        
+        reply_text = response.text
+        chat_history.append({"role": "model", "parts": [{"text": reply_text}]})
+        student["history"] = chat_history # עדכון ההיסטוריה
+        
+        await update.message.reply_text(reply_text)
+
+    except Exception as e:
+        logger.error(f"Gemini API Error: {e}")
+        await update.message.reply_text("⚠️ Sorry, I encountered an error communicating with the AI. Please try again.")
 
 if __name__ == '__main__':
     application = ApplicationBuilder().token(TOKEN).build()
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
-    logger.info("Interactive Finnish Tutor Bot is running...")
+    logger.info("AI Finnish Tutor Bot is running...")
     application.run_polling()
