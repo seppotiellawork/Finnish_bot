@@ -1,4 +1,2 @@
-torch
-transformers
-scipy
 python-telegram-bot
+gTTS
