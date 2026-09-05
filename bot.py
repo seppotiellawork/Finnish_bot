@@ -104,7 +104,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Error: GEMINI_API_KEY is missing in Render Environment variables.")
         return
 
-    # 2. בניית הנחיית מערכת (System Instructions) למורה הפרטי
+    # 2. בניית הנחיית מערכת למורה הפרטי
     system_instruction = (
         "You are an expert, friendly, and conversational Finnish private tutor. "
         "You are helping a student learn Finnish step-by-step using their textbook content provided below. "
@@ -116,20 +116,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         # שמירת היסטוריית שיחה ושליחה ל-Gemini
         chat_history = student.get("history", [])
-        chat_history.append({"role": "user", "parts": [{"text": user_text}]})
+        chat_history.append(f"User: {user_text}")
+        
+        full_prompt = (
+            f"{system_instruction}\n\n"
+            f"Conversation History:\n" + "\n".join(chat_history) + "\nTutor:"
+        )
         
         response = client.models.generate_content(
             model='gemini-2.5-flash',
-            contents=chat_history,
-            config={
-                'system_instruction': system_instruction,
-                'temperature': 0.7,
-            }
+            contents=full_prompt,
         )
         
-        reply_text = response.text
-        chat_history.append({"role": "model", "parts": [{"text": reply_text}]})
-        student["history"] = chat_history # עדכון ההיסטוריה
+        reply_text = response.text.strip()
+        chat_history.append(f"Tutor: {reply_text}")
+        student["history"] = chat_history[-10:] # שומר את 10 ההודעות האחרונות
         
         await update.message.reply_text(reply_text)
 
